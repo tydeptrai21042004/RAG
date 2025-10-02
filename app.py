@@ -3,18 +3,20 @@
 """
 Ultra-light Flask backend:
 - Gemini 2.0 Flash
-- CSV RAG via TF-IDF (no Torch, no FAISS)
+- CSV RAG via pure-Python TF-IDF (no pandas, no numpy, no sklearn)
 - Endpoints: /health, /data/load, /data/preview, /rag/ask, /chat, /classify/retail
 """
 
-import os, re, json
+import os, re, json, math, csv
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+from collections import Counter, defaultdict
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google import genai
 from google.genai import types as gtypes
+from unidecode import unidecode
 
 # ---------------- Gemini ----------------
 MODEL_ID = os.getenv("MODEL_ID", "gemini-2.0-flash-001")
@@ -32,22 +34,23 @@ def get_client():
         _client = genai.Client(api_key=API_KEY)
     return _client
 
-# ---------------- CSV + TF-IDF RAG ----------------
-import pandas as pd
-from unidecode import unidecode
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import linear_kernel  # fast dot for CSR
+# ---------------- Tiny CSV + TF-IDF RAG ----------------
+_rows: List[Dict[str, str]] = []     # raw CSV rows (list of dicts)
+_passages: List[str] = []            # text used for retrieval
+_meta: List[Dict[str, Any]] = []     # small metadata per row
 
-_df: pd.DataFrame | None = None
-_vec: TfidfVectorizer | None = None
-_mat = None  # scipy.sparse CSR
-_passages: List[str] = []
-_meta: List[Dict[str, Any]] = []
+# TF-IDF structures (pure Python)
+_vocab_df: Dict[str, int] = {}       # document frequency per term
+_doc_vecs: List[Dict[str, float]] = []  # tf-idf sparse vectors per doc
+_doc_norms: List[float] = []         # L2 norm per doc
+_N_docs: int = 0
 
-def _s(x): return "" if pd.isna(x) else str(x)
-def _nd(x): return unidecode(x or "")
+# ------------ CSV helpers ------------
+def _s(x): 
+    if x is None: return ""
+    return str(x)
 
-def _row_to_passage(row: pd.Series) -> str:
+def _row_to_passage(row: Dict[str, str]) -> str:
     name = _s(row.get("product_name"))
     desc = _s(row.get("description"))
     status = _s(row.get("product_status"))
@@ -70,10 +73,9 @@ def _row_to_passage(row: pd.Series) -> str:
         f"Ngày bắt đầu: {start_date}",
         "Mô tả: " + (desc[:400] + ("..." if len(desc) > 400 else "")),
     ])
-    # Accent-fold duplicates to help VI without diacritics
-    return core + "\n" + "UNACCENT: " + _nd(" ".join([name, desc]))
+    return core + "\nUNACCENT: " + unidecode(" ".join([name, desc]))
 
-def _row_to_meta(row: pd.Series) -> Dict[str, Any]:
+def _row_to_meta(row: Dict[str, str]) -> Dict[str, Any]:
     fields = ["product_name","available_quantity","onhand_quantity","product_status",
               "saleprice","start_date","regprice","reg_sdate","reg_edate",
               "prmprice","prmprice_wo_vat","prm_sdate","prm_edate","rundate","description","document"]
@@ -84,37 +86,90 @@ def _row_to_meta(row: pd.Series) -> Dict[str, Any]:
         m["_qty"] = 0
     return m
 
-def _build_index(df: pd.DataFrame):
-    global _df, _vec, _mat, _passages, _meta
-    _df = df
-    _passages = [_row_to_passage(df.iloc[i]) for i in range(len(df))]
-    _meta = [_row_to_meta(df.iloc[i]) for i in range(len(df))]
+# ------------ Tiny tokenizer ------------
+TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
-    # Lightweight TF-IDF for Vietnamese:
-    # - unicode accent strip by pre-adding UNACCENT text
-    # - word+bigram to catch short product names
-    _vec = TfidfVectorizer(
-        ngram_range=(1,2),
-        min_df=1,
-        max_df=0.98,
-        lowercase=True,
-        strip_accents="unicode",  # helps VN
-    )
-    _mat = _vec.fit_transform(_passages)  # CSR sparse matrix
+def tokenize(text: str) -> List[str]:
+    # lowercase + remove accents
+    t = unidecode((text or "").lower())
+    toks = TOKEN_RE.findall(t)
+    # add bigrams for better matching of short names
+    bigrams = [f"{toks[i]}_{toks[i+1]}" for i in range(len(toks)-1)]
+    return toks + bigrams
 
-def _search(query: str, k: int = 3):
-    if _mat is None or _vec is None:
+# ------------ Build TF-IDF ------------
+def build_tfidf(passages: List[str]) -> Tuple[List[Dict[str,float]], List[float], Dict[str,int], int]:
+    N = len(passages)
+    df = defaultdict(int)
+    doc_tokens: List[List[str]] = []
+    # collect DF
+    for p in passages:
+        toks = tokenize(p)
+        doc_tokens.append(toks)
+        for term in set(toks):
+            df[term] += 1
+    # compute tf-idf vectors
+    vecs = []
+    norms = []
+    for toks in doc_tokens:
+        counts = Counter(toks)
+        length = sum(counts.values()) or 1
+        vec = {}
+        for term, cnt in counts.items():
+            tf = cnt / length
+            idf = math.log((N + 1) / (df[term] + 1)) + 1.0
+            vec[term] = tf * idf
+        # L2 norm
+        norm = math.sqrt(sum(w*w for w in vec.values())) or 1.0
+        vecs.append(vec)
+        norms.append(norm)
+    return vecs, norms, dict(df), N
+
+def cosine_for_query(q: str, vecs: List[Dict[str,float]], norms: List[float], df: Dict[str,int], N: int) -> List[float]:
+    toks = tokenize(q + "\nUNACCENT: " + unidecode(q))
+    counts = Counter(toks)
+    length = sum(counts.values()) or 1
+    q_vec = {}
+    for term, cnt in counts.items():
+        tf = cnt / length
+        idf = math.log((N + 1) / ((df.get(term) or 0) + 1)) + 1.0
+        q_vec[term] = tf * idf
+    q_norm = math.sqrt(sum(w*w for w in q_vec.values())) or 1.0
+
+    sims: List[float] = []
+    for dvec, dnorm in zip(vecs, norms):
+        # sparse dot over intersection
+        dot = 0.0
+        # iterate over smaller dict
+        (small, big) = (q_vec, dvec) if len(q_vec) < len(dvec) else (dvec, q_vec)
+        for term, w in small.items():
+            if term in big:
+                dot += w * big[term]
+        sims.append(dot / (dnorm * q_norm))
+    return sims
+
+# ------------ RAG builder ------------
+def build_index(rows: List[Dict[str,str]]):
+    global _rows, _passages, _meta, _doc_vecs, _doc_norms, _vocab_df, _N_docs
+    _rows = rows
+    _passages = [_row_to_passage(r) for r in rows]
+    _meta = [_row_to_meta(r) for r in rows]
+    _doc_vecs, _doc_norms, _vocab_df, _N_docs = build_tfidf(_passages)
+
+def preview_rows(n: int = 5) -> List[Dict[str,str]]:
+    return _rows[:n]
+
+def search(query: str, k: int = 3):
+    if not _rows:
         return []
-    q = f"{query}\nUNACCENT: {_nd(query)}"
-    qv = _vec.transform([q])  # 1 x N
-    sims = linear_kernel(qv, _mat).ravel()  # dot since tf-idf is L2-normalized
-    topk = sims.argsort()[::-1][:k]
-    out = []
+    sims = cosine_for_query(query, _doc_vecs, _doc_norms, _vocab_df, _N_docs)
+    topk = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:k]
+    results = []
     for rank, i in enumerate(topk, 1):
-        out.append({"rank": rank, "score": float(sims[i]), "passage": _passages[i], "meta": _meta[i]})
-    return out
+        results.append({"rank": rank, "score": float(sims[i]), "passage": _passages[i], "meta": _meta[i]})
+    return results
 
-# --------- Rule-based short answers ----------
+# ------------ Rule-based answers ------------
 PRICE_PAT = re.compile(r"(gia|giá|price|bao nhi[uê]u|cost)", re.I)
 STOCK_PAT = re.compile(r"(c[oò]n h[aà]ng|t[oà]n|stock|available|quantity|s[ốo] l[uư][ơo]ng)", re.I)
 PROMO_PAT = re.compile(r"(kh[uuy]ến m[aã]i|promo|sale|gi[aá] [gG]i[aả]m)", re.I)
@@ -125,24 +180,31 @@ def _money(v):
     try: return f"{int(float(v)):,}".replace(",", ".")
     except: return str(v)
 
-def _answer_direct(q: str, results: List[Dict[str,Any]]) -> str:
+def answer_direct(q: str, results: List[Dict[str,Any]]) -> str:
     if not results:
         return "Chưa có dữ liệu hoặc không tìm thấy sản phẩm."
     hit = results[0]["meta"]; name = hit.get("product_name","(không tên)")
     q_nodiac = unidecode(q.lower())
     now = datetime.now()
 
-    def _inwin(s, e):
+    def inwin(s, e):
         try:
-            import pandas as _pd
-            sd = _pd.to_datetime(s) if s else None
-            ed = _pd.to_datetime(e) if e else None
+            from datetime import datetime
+            from dateutil.parser import isoparse
+        except Exception:
+            # Fallback: naive parse
+            pass
+        try:
+            import datetime as _dt
+            sd = _try_parse_date(s)
+            ed = _try_parse_date(e)
             if sd and ed: return sd <= now <= ed
-        except: pass
+        except:
+            pass
         return False
 
     if PRICE_PAT.search(q) or "gia" in q_nodiac or "price" in q_nodiac:
-        if _inwin(hit.get("prm_sdate"), hit.get("prm_edate")) and hit.get("prmprice") not in ("", "0", "0.0", None):
+        if inwin(hit.get("prm_sdate"), hit.get("prm_edate")) and hit.get("prmprice") not in ("", "0", "0.0", None):
             return f"Giá khuyến mãi của **{name}**: **{_money(hit['prmprice'])}₫**."
         if hit.get("saleprice"):
             return f"Giá bán của **{name}**: **{_money(hit['saleprice'])}₫**."
@@ -167,36 +229,52 @@ def _answer_direct(q: str, results: List[Dict[str,Any]]) -> str:
 
     return f"Tìm thấy **{name}**. Giá bán: {_money(hit.get('saleprice',''))}₫."
 
+def _try_parse_date(s: str):
+    if not s: return None
+    # very loose: try fromisoformat; else return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace("Z","").strip())
+    except:
+        return None
+
 # ---------------- Endpoints ----------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "model": MODEL_ID, "data_loaded": _df is not None, "rows": 0 if _df is None else len(_df)})
+    return jsonify({"ok": True, "model": MODEL_ID, "data_loaded": bool(_rows), "rows": len(_rows)})
 
 @app.post("/data/load")
 def data_load():
+    """
+    Load CSV to memory and build TF-IDF index.
+    Accepts:
+      - multipart/form-data with file field 'file'
+      - JSON: {"path": "/path/to/file.csv"}
+    """
     try:
         if "file" in request.files:
             f = request.files["file"]
-            df = pd.read_csv(f)
+            rows = list(csv.DictReader((line.decode("utf-8") for line in f.stream)))
         else:
             data = request.get_json(force=True, silent=True) or {}
             path = (data.get("path") or "").strip()
             if not path:
                 return jsonify({"error": "Provide a CSV via multipart 'file' or JSON {'path': '...'}"}), 400
-            df = pd.read_csv(path)
-        if df.empty:
+            with open(path, "r", encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+        if not rows:
             return jsonify({"error": "CSV is empty"}), 400
-        _build_index(df)
-        return jsonify({"ok": True, "rows": len(df)})
+        build_index(rows)
+        return jsonify({"ok": True, "rows": len(rows)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/data/preview")
 def data_preview():
-    if _df is None:
+    if not _rows:
         return jsonify({"error": "No CSV loaded"}), 400
     n = int(request.args.get("n", 5))
-    return jsonify({"rows": _df.head(n).to_dict(orient="records")})
+    return jsonify({"rows": preview_rows(n)})
 
 @app.post("/rag/ask")
 def rag_ask():
@@ -205,11 +283,11 @@ def rag_ask():
     k = int(data.get("k", 3))
     if not q:
         return jsonify({"error":"Missing 'q'"}), 400
-    if _mat is None:
+    if not _rows:
         return jsonify({"error":"No CSV loaded"}), 400
-    results = _search(q, k=k)
+    results = search(q, k=k)
     return jsonify({
-        "answer": _answer_direct(q, results),
+        "answer": answer_direct(q, results),
         "matches": [
             {"rank": r["rank"], "score": r["score"], "name": r["meta"]["product_name"]}
             for r in results
@@ -254,13 +332,15 @@ def classify_retail():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
+    # Auto-load via env PRODUCT_CSV if provided
     csv_path = os.getenv("PRODUCT_CSV")
     if csv_path and os.path.exists(csv_path):
         try:
-            df0 = pd.read_csv(csv_path)
-            if not df0.empty:
-                _build_index(df0)
-                app.logger.info(f"Loaded PRODUCT_CSV: {csv_path} with {len(df0)} rows")
+            with open(csv_path, "r", encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+            if rows:
+                build_index(rows)
+                app.logger.info(f"Loaded PRODUCT_CSV: {csv_path} with {len(rows)} rows")
         except Exception as e:
             app.logger.error(f"Failed to load PRODUCT_CSV: {e}")
     port = int(os.getenv("PORT", "7860"))
