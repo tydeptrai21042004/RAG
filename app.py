@@ -11,7 +11,8 @@ import os, re, json, math, csv
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 from collections import Counter, defaultdict
-
+import os, re, json, math, csv
+from urllib.request import urlopen  # stdlib, no extra dep
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google import genai
@@ -330,10 +331,37 @@ def classify_retail():
         return jsonify(resp.parsed or {"raw": resp.text})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+# ---- NEW: preload at import (supports URL or file) ----
+def preload_data_on_import():
+    try:
+        # Prefer URL if provided
+        src_url = (os.getenv("PRODUCT_CSV_URL") or "").strip()
+        if src_url.startswith("http"):
+            try:
+                text = urlopen(src_url, timeout=30).read().decode("utf-8")
+                rows = list(csv.DictReader(text.splitlines()))
+                if rows:
+                    build_index(rows)
+                    app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV_URL")
+                    return
+            except Exception as e:
+                app.logger.warning(f"Preload from URL failed: {e}")
 
+        # Fallback: local path
+        src_path = (os.getenv("PRODUCT_CSV") or "").strip()
+        if src_path and os.path.exists(src_path):
+            with open(src_path, "r", encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+            if rows:
+                build_index(rows)
+                app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV")
+    except Exception as e:
+        app.logger.error(f"Preload error: {e}")
 if __name__ == "__main__":
     # Auto-load via env PRODUCT_CSV if provided
     csv_path = os.getenv("PRODUCT_CSV")
+    preload_data_on_import()
+
     if csv_path and os.path.exists(csv_path):
         try:
             with open(csv_path, "r", encoding="utf-8") as fp:
