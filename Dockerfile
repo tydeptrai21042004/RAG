@@ -7,11 +7,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# System deps needed by start.sh
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code + the data folder into the image
+# Copy code + start script
 COPY . /app
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
-# 1 worker to keep RAM low
+# Use start.sh as ENTRYPOINT so it runs even if render.yaml sets dockerCommand
+ENTRYPOINT ["/app/start.sh"]
+
+# Default command (Render may override via dockerCommand; ENTRYPOINT still runs)
 CMD ["gunicorn", "-w", "1", "-k", "gthread", "-b", "0.0.0.0:7860", "app:app"]
