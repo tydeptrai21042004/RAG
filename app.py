@@ -5,14 +5,18 @@ Ultra-light Flask backend:
 - Gemini 2.0 Flash
 - CSV RAG via pure-Python TF-IDF (no pandas, no numpy, no sklearn)
 - Endpoints: /health, /data/load, /data/preview, /rag/ask, /chat, /classify/retail
+
+Production note:
+- Gunicorn imports `app:app` and DOES NOT run the `if __name__ == "__main__"` block.
+  Therefore, CSV preload must occur at import time. 
 """
 
 import os, re, json, math, csv
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 from collections import Counter, defaultdict
-import os, re, json, math, csv
-from urllib.request import urlopen  # stdlib, no extra dep
+from urllib.request import urlopen
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google import genai
@@ -47,7 +51,7 @@ _doc_norms: List[float] = []         # L2 norm per doc
 _N_docs: int = 0
 
 # ------------ CSV helpers ------------
-def _s(x): 
+def _s(x):
     if x is None: return ""
     return str(x)
 
@@ -170,6 +174,62 @@ def search(query: str, k: int = 3):
         results.append({"rank": rank, "score": float(sims[i]), "passage": _passages[i], "meta": _meta[i]})
     return results
 
+# ---- Preload at import (supports URL or file) ----
+def _resolve_local_csv(candidate: str) -> str:
+    """Try a few sensible paths for a short value like 'cleaned_products'."""
+    if not candidate:
+        return ""
+    probe = [
+        candidate,
+        os.path.join(os.getcwd(), candidate),
+        os.path.join("/app", candidate),
+        candidate + ".csv",
+        os.path.join(os.getcwd(), candidate + ".csv"),
+        os.path.join("/app", candidate + ".csv"),
+    ]
+    for p in probe:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+def preload_data_on_import():
+    try:
+        # Prefer URL if provided
+        src_url = (os.getenv("PRODUCT_CSV_URL") or "").strip()
+        if src_url.startswith("http"):
+            try:
+                text = urlopen(src_url, timeout=30).read().decode("utf-8")
+                rows = list(csv.DictReader(text.splitlines()))
+                if rows:
+                    build_index(rows)
+                    app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV_URL")
+                    return
+                app.logger.warning("PRODUCT_CSV_URL fetched but CSV is empty.")
+            except Exception as e:
+                app.logger.warning(f"Preload from URL failed: {e}")
+
+        # Fallback: local path (supports short names like 'cleaned_products')
+        raw_path = (os.getenv("PRODUCT_CSV") or "").strip()
+        path = _resolve_local_csv(raw_path)
+        if path:
+            with open(path, "r", encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+            if rows:
+                build_index(rows)
+                app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV ({path})")
+                return
+            app.logger.warning(f"PRODUCT_CSV found at {path} but CSV is empty.")
+        else:
+            if raw_path:
+                app.logger.warning(f"PRODUCT_CSV='{raw_path}' not found. "
+                                   f"Consider absolute path or set PRODUCT_CSV_URL.")
+    except Exception as e:
+        app.logger.error(f"Preload error: {e}")
+
+# Call once on import (works under Gunicorn)
+preload_data_on_import()
+# ---- End preload ----
+
 # ------------ Rule-based answers ------------
 PRICE_PAT = re.compile(r"(gia|giá|price|bao nhi[uê]u|cost)", re.I)
 STOCK_PAT = re.compile(r"(c[oò]n h[aà]ng|t[oà]n|stock|available|quantity|s[ốo] l[uư][ơo]ng)", re.I)
@@ -191,12 +251,10 @@ def answer_direct(q: str, results: List[Dict[str,Any]]) -> str:
     def inwin(s, e):
         try:
             from datetime import datetime
-            from dateutil.parser import isoparse
+            from dateutil.parser import isoparse  # optional; ignore if missing
         except Exception:
-            # Fallback: naive parse
             pass
         try:
-            import datetime as _dt
             sd = _try_parse_date(s)
             ed = _try_parse_date(e)
             if sd and ed: return sd <= now <= ed
@@ -232,9 +290,7 @@ def answer_direct(q: str, results: List[Dict[str,Any]]) -> str:
 
 def _try_parse_date(s: str):
     if not s: return None
-    # very loose: try fromisoformat; else return None
     try:
-        from datetime import datetime
         return datetime.fromisoformat(s.replace("Z","").strip())
     except:
         return None
@@ -327,49 +383,16 @@ def classify_retail():
     }
     cfg = gtypes.GenerateContentConfig(response_mime_type="application/json", response_schema=schema)
     try:
-        resp = client.models.generate_content(model=MODEL_ID, contents=[gtypes.SystemInstruction.from_text(system), text], config=cfg)
+        resp = client.models.generate_content(
+            model=MODEL_ID,
+            contents=[gtypes.SystemInstruction.from_text(system), text],
+            config=cfg
+        )
         return jsonify(resp.parsed or {"raw": resp.text})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# ---- NEW: preload at import (supports URL or file) ----
-def preload_data_on_import():
-    try:
-        # Prefer URL if provided
-        src_url = (os.getenv("PRODUCT_CSV_URL") or "").strip()
-        if src_url.startswith("http"):
-            try:
-                text = urlopen(src_url, timeout=30).read().decode("utf-8")
-                rows = list(csv.DictReader(text.splitlines()))
-                if rows:
-                    build_index(rows)
-                    app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV_URL")
-                    return
-            except Exception as e:
-                app.logger.warning(f"Preload from URL failed: {e}")
 
-        # Fallback: local path
-        src_path = (os.getenv("PRODUCT_CSV") or "").strip()
-        if src_path and os.path.exists(src_path):
-            with open(src_path, "r", encoding="utf-8") as fp:
-                rows = list(csv.DictReader(fp))
-            if rows:
-                build_index(rows)
-                app.logger.info(f"Preloaded {len(rows)} rows from PRODUCT_CSV")
-    except Exception as e:
-        app.logger.error(f"Preload error: {e}")
+# Dev-only runner (won't run under Gunicorn)
 if __name__ == "__main__":
-    # Auto-load via env PRODUCT_CSV if provided
-    csv_path = os.getenv("PRODUCT_CSV")
-    preload_data_on_import()
-
-    if csv_path and os.path.exists(csv_path):
-        try:
-            with open(csv_path, "r", encoding="utf-8") as fp:
-                rows = list(csv.DictReader(fp))
-            if rows:
-                build_index(rows)
-                app.logger.info(f"Loaded PRODUCT_CSV: {csv_path} with {len(rows)} rows")
-        except Exception as e:
-            app.logger.error(f"Failed to load PRODUCT_CSV: {e}")
     port = int(os.getenv("PORT", "7860"))
     app.run(host="0.0.0.0", port=port, debug=True)
